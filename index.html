@@ -3,33 +3,105 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Barcode Scanner</title>
+  <title>1D Barcode Scanner</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 16px; }
     .wrap { max-width: 700px; margin: 0 auto; }
     h1 { font-size: 20px; margin: 0 0 12px; }
-    video { width: 100%; border-radius: 12px; background: #111; }
-    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+
+    .preview {
+      position: relative;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #111;
+    }
+
+    video { width: 100%; display: block; background: #111; }
+
+    /* Simple scan “window” overlay to help aim 1D barcodes */
+    .overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .scanbox {
+      position: absolute;
+      left: 8%;
+      right: 8%;
+      top: 42%;
+      height: 16%;
+      border: 2px solid rgba(255,255,255,0.85);
+      border-radius: 10px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,0.25);
+    }
+    .scanline {
+      position: absolute;
+      left: 10%;
+      right: 10%;
+      top: 50%;
+      height: 2px;
+      background: rgba(255,255,255,0.85);
+      opacity: 0.65;
+    }
+    .tapHint {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.45);
+      border-radius: 999px;
+      pointer-events: none;
+    }
+
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; align-items: center; }
     button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #fff; }
     button:disabled { opacity: 0.6; }
+
+    .control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid #e5e5e5;
+      border-radius: 10px;
+      background: #fff;
+    }
+    .control label { font-size: 12px; color: #666; }
+    input[type="range"] { width: 160px; }
+
     .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin-top: 12px; }
     .label { font-size: 12px; color: #666; margin-bottom: 6px; }
     .value { font-size: 18px; word-break: break-all; }
     ul { margin: 8px 0 0; padding-left: 18px; }
-    .hint { font-size: 12px; color: #666; margin-top: 10px; }
+    .hint { font-size: 12px; color: #666; margin-top: 10px; line-height: 1.3; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Barcode Scanner</h1>
+    <h1>1D Barcode Scanner</h1>
 
-    <video id="video" playsinline></video>
+    <div class="preview">
+      <video id="video" playsinline></video>
+      <div class="overlay">
+        <div class="scanbox"></div>
+        <div class="scanline"></div>
+        <div class="tapHint">Tap video to refocus</div>
+      </div>
+    </div>
 
     <div class="row">
       <button id="startBtn">Start camera</button>
       <button id="stopBtn" disabled>Stop</button>
-      <button id="torchBtn" disabled>Toggle torch</button>
+      <button id="refocusBtn" disabled>Refocus</button>
+      <button id="torchBtn" disabled>Torch</button>
       <button id="clearBtn">Clear history</button>
+
+      <span id="zoomWrap" class="control" style="display:none;">
+        <label for="zoomSlider">Zoom</label>
+        <input id="zoomSlider" type="range" min="1" max="1" step="0.1" value="1" />
+      </span>
     </div>
 
     <div class="card">
@@ -43,21 +115,26 @@
     </div>
 
     <div class="hint">
-      Tip: This must be served over HTTPS on iPhone. After it works, use Safari → Share → “Add to Home Screen”.
+      Notes: iPhone camera access requires HTTPS (or localhost). For tiny 1D codes, use good lighting, move closer,
+      and try Zoom + tap-to-focus. Add to Home Screen via Safari → Share → “Add to Home Screen”.
     </div>
   </div>
 
-  <!-- ZXing fallback (only used if BarcodeDetector is missing/limited) -->
+  <!-- ZXing fallback (used if BarcodeDetector is missing/limited) -->
   <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
 
   <script>
     const video = document.getElementById("video");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const refocusBtn = document.getElementById("refocusBtn");
     const torchBtn = document.getElementById("torchBtn");
     const clearBtn = document.getElementById("clearBtn");
     const latestEl = document.getElementById("latest");
     const historyEl = document.getElementById("history");
+
+    const zoomWrap = document.getElementById("zoomWrap");
+    const zoomSlider = document.getElementById("zoomSlider");
 
     let stream = null;
     let scanning = false;
@@ -66,7 +143,7 @@
 
     // BarcodeDetector path
     let detector = null;
-    let useBarcodeDetector = ("BarcodeDetector" in window);
+    const useBarcodeDetector = ("BarcodeDetector" in window);
 
     // ZXing path
     let zxingReader = null;
@@ -75,7 +152,6 @@
       const li = document.createElement("li");
       li.textContent = text;
       historyEl.prepend(li);
-      // keep last 20
       while (historyEl.children.length > 20) historyEl.removeChild(historyEl.lastChild);
     }
 
@@ -84,8 +160,91 @@
     }
 
     function isSecureContextOk() {
-      // iPhone camera requires HTTPS (except localhost)
       return window.isSecureContext || location.hostname === "localhost";
+    }
+
+    function getVideoTrack() {
+      return stream?.getVideoTracks?.()[0] || null;
+    }
+
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function setAutoFocusBestEffort() {
+      const track = getVideoTrack();
+      if (!track) return;
+
+      // These may be ignored depending on browser/iOS version; safe to try.
+      const tries = [
+        { advanced: [{ focusMode: "continuous" }] },
+        { advanced: [{ focusMode: "auto" }] }
+      ];
+
+      for (const c of tries) {
+        try {
+          await track.applyConstraints(c);
+          return;
+        } catch {}
+      }
+    }
+
+    async function tapToRefocus(clientX, clientY) {
+      // iOS Safari support varies. We'll do best-effort and fall back to autofocus.
+      const track = getVideoTrack();
+      if (!track) return;
+
+      const rect = video.getBoundingClientRect();
+      const x = (clientX - rect.left) / rect.width;
+      const y = (clientY - rect.top) / rect.height;
+
+      try {
+        await track.applyConstraints({
+          advanced: [{
+            // Not widely supported, but harmless if ignored.
+            pointsOfInterest: [{ x, y }],
+            focusMode: "continuous"
+          }]
+        });
+      } catch {
+        await setAutoFocusBestEffort();
+      }
+    }
+
+    function setupZoomIfAvailable() {
+      const track = getVideoTrack();
+      if (!track || !track.getCapabilities) return;
+
+      const caps = track.getCapabilities();
+      if (!caps.zoom) {
+        zoomWrap.style.display = "none";
+        return;
+      }
+
+      // Show zoom slider
+      zoomWrap.style.display = "inline-flex";
+      zoomSlider.min = String(caps.zoom.min);
+      zoomSlider.max = String(caps.zoom.max);
+      zoomSlider.step = String(caps.zoom.step || 0.1);
+
+      const settings = track.getSettings ? track.getSettings() : {};
+      zoomSlider.value = String(settings.zoom || caps.zoom.min || 1);
+    }
+
+    async function applyZoom(val) {
+      const track = getVideoTrack();
+      if (!track) return;
+      try {
+        await track.applyConstraints({ advanced: [{ zoom: val }] });
+      } catch {
+        // ignore if not supported
+      }
+    }
+
+    function setupTorchIfAvailable() {
+      const track = getVideoTrack();
+      const caps = track?.getCapabilities ? track.getCapabilities() : {};
+      torchBtn.disabled = !caps.torch;
     }
 
     async function startCamera() {
@@ -94,11 +253,12 @@
         return;
       }
 
+      // Higher resolution helps for tiny 1D barcodes (more pixels across bars)
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         },
         audio: false
       });
@@ -106,27 +266,31 @@
       video.srcObject = stream;
       await video.play();
 
-      // Torch availability check
-      const track = stream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      torchBtn.disabled = !caps.torch;
+      // Setup capabilities-based controls
+      setupTorchIfAvailable();
+      setupZoomIfAvailable();
+      refocusBtn.disabled = false;
 
-      // Prefer BarcodeDetector when available
+      // 1D formats only (BarcodeDetector supports some; we filter to the common 1D set)
       if (useBarcodeDetector) {
         try {
-          // some browsers allow specifying formats; if it throws, we still try default
           detector = new BarcodeDetector({
             formats: [
-              "qr_code", "ean_13", "ean_8", "code_128", "code_39", "upc_a", "upc_e", "itf", "data_matrix", "pdf417"
+              "ean_13", "ean_8",
+              "upc_a", "upc_e",
+              "code_128", "code_39",
+              "itf"
             ]
           });
         } catch {
           detector = new BarcodeDetector();
         }
       } else {
-        // ZXing setup
+        // ZXing supports 1D well
         zxingReader = new ZXing.BrowserMultiFormatReader();
       }
+
+      await setAutoFocusBestEffort();
 
       scanning = true;
       startBtn.disabled = true;
@@ -155,8 +319,12 @@
 
       startBtn.disabled = false;
       stopBtn.disabled = true;
+      refocusBtn.disabled = true;
+
       torchBtn.disabled = true;
       torchOn = false;
+
+      zoomWrap.style.display = "none";
     }
 
     async function scanLoopBarcodeDetector() {
@@ -164,19 +332,20 @@
         try {
           const codes = await detector.detect(video);
           if (codes && codes.length) {
+            // pick first code; you could also choose longest rawValue, etc.
             const value = codes[0].rawValue || "";
             if (value && value !== lastValue) {
               lastValue = value;
               setLatest(value);
               addToHistory(value);
-              // simple debounce so it doesn't spam
-              await new Promise(r => setTimeout(r, 800));
+              // debounce so a held barcode doesn't spam
+              await sleep(900);
             }
           }
-        } catch (e) {
+        } catch {
           // ignore transient errors
         }
-        await new Promise(r => setTimeout(r, 120));
+        await sleep(120);
       }
     }
 
@@ -196,31 +365,47 @@
     }
 
     async function toggleTorch() {
-      if (!stream) return;
-      const track = stream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if (!caps.torch) return;
+      const track = getVideoTrack();
+      const caps = track?.getCapabilities ? track.getCapabilities() : {};
+      if (!track || !caps.torch) return;
 
       torchOn = !torchOn;
       try {
         await track.applyConstraints({ advanced: [{ torch: torchOn }] });
-      } catch (e) {
-        torchOn = !torchOn; // revert if failed
+      } catch {
+        torchOn = !torchOn;
       }
     }
 
+    // Events
     startBtn.addEventListener("click", () => startCamera().catch(err => {
       console.error(err);
       alert("Could not start camera. Make sure you allowed camera access in Safari settings.");
     }));
 
     stopBtn.addEventListener("click", stopCamera);
+
+    refocusBtn.addEventListener("click", () => {
+      setAutoFocusBestEffort();
+    });
+
     torchBtn.addEventListener("click", toggleTorch);
 
     clearBtn.addEventListener("click", () => {
       historyEl.innerHTML = "";
       setLatest("—");
       lastValue = "";
+    });
+
+    // Tap-to-focus on the preview
+    video.addEventListener("click", (e) => {
+      tapToRefocus(e.clientX, e.clientY);
+    });
+
+    // Zoom slider (if supported)
+    zoomSlider.addEventListener("input", (e) => {
+      const val = parseFloat(e.target.value);
+      applyZoom(val);
     });
   </script>
 </body>
