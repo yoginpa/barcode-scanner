@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Barcode Scanner</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 16px; }
+    .wrap { max-width: 700px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    video { width: 100%; border-radius: 12px; background: #111; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #fff; }
+    button:disabled { opacity: 0.6; }
+    .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin-top: 12px; }
+    .label { font-size: 12px; color: #666; margin-bottom: 6px; }
+    .value { font-size: 18px; word-break: break-all; }
+    ul { margin: 8px 0 0; padding-left: 18px; }
+    .hint { font-size: 12px; color: #666; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Barcode Scanner</h1>
+
+    <video id="video" playsinline></video>
+
+    <div class="row">
+      <button id="startBtn">Start camera</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="torchBtn" disabled>Toggle torch</button>
+      <button id="clearBtn">Clear history</button>
+    </div>
+
+    <div class="card">
+      <div class="label">Latest scan</div>
+      <div id="latest" class="value">—</div>
+    </div>
+
+    <div class="card">
+      <div class="label">History</div>
+      <ul id="history"></ul>
+    </div>
+
+    <div class="hint">
+      Tip: This must be served over HTTPS on iPhone. After it works, use Safari → Share → “Add to Home Screen”.
+    </div>
+  </div>
+
+  <!-- ZXing fallback (only used if BarcodeDetector is missing/limited) -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const torchBtn = document.getElementById("torchBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const latestEl = document.getElementById("latest");
+    const historyEl = document.getElementById("history");
+
+    let stream = null;
+    let scanning = false;
+    let lastValue = "";
+    let torchOn = false;
+
+    // BarcodeDetector path
+    let detector = null;
+    let useBarcodeDetector = ("BarcodeDetector" in window);
+
+    // ZXing path
+    let zxingReader = null;
+
+    function addToHistory(text) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      historyEl.prepend(li);
+      // keep last 20
+      while (historyEl.children.length > 20) historyEl.removeChild(historyEl.lastChild);
+    }
+
+    function setLatest(text) {
+      latestEl.textContent = text || "—";
+    }
+
+    function isSecureContextOk() {
+      // iPhone camera requires HTTPS (except localhost)
+      return window.isSecureContext || location.hostname === "localhost";
+    }
+
+    async function startCamera() {
+      if (!isSecureContextOk()) {
+        alert("Camera requires HTTPS on iPhone. Host this page on HTTPS (e.g., GitHub Pages).");
+        return;
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      // Torch availability check
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      torchBtn.disabled = !caps.torch;
+
+      // Prefer BarcodeDetector when available
+      if (useBarcodeDetector) {
+        try {
+          // some browsers allow specifying formats; if it throws, we still try default
+          detector = new BarcodeDetector({
+            formats: [
+              "qr_code", "ean_13", "ean_8", "code_128", "code_39", "upc_a", "upc_e", "itf", "data_matrix", "pdf417"
+            ]
+          });
+        } catch {
+          detector = new BarcodeDetector();
+        }
+      } else {
+        // ZXing setup
+        zxingReader = new ZXing.BrowserMultiFormatReader();
+      }
+
+      scanning = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      if (useBarcodeDetector) {
+        scanLoopBarcodeDetector();
+      } else {
+        scanLoopZXing();
+      }
+    }
+
+    function stopCamera() {
+      scanning = false;
+
+      if (zxingReader) {
+        try { zxingReader.reset(); } catch {}
+        zxingReader = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      torchBtn.disabled = true;
+      torchOn = false;
+    }
+
+    async function scanLoopBarcodeDetector() {
+      while (scanning && detector && video.readyState >= 2) {
+        try {
+          const codes = await detector.detect(video);
+          if (codes && codes.length) {
+            const value = codes[0].rawValue || "";
+            if (value && value !== lastValue) {
+              lastValue = value;
+              setLatest(value);
+              addToHistory(value);
+              // simple debounce so it doesn't spam
+              await new Promise(r => setTimeout(r, 800));
+            }
+          }
+        } catch (e) {
+          // ignore transient errors
+        }
+        await new Promise(r => setTimeout(r, 120));
+      }
+    }
+
+    function scanLoopZXing() {
+      // ZXing decodes continuously
+      zxingReader.decodeFromVideoDevice(null, video, (result, err) => {
+        if (!scanning) return;
+        if (result) {
+          const value = result.getText();
+          if (value && value !== lastValue) {
+            lastValue = value;
+            setLatest(value);
+            addToHistory(value);
+          }
+        }
+      });
+    }
+
+    async function toggleTorch() {
+      if (!stream) return;
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (!caps.torch) return;
+
+      torchOn = !torchOn;
+      try {
+        await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+      } catch (e) {
+        torchOn = !torchOn; // revert if failed
+      }
+    }
+
+    startBtn.addEventListener("click", () => startCamera().catch(err => {
+      console.error(err);
+      alert("Could not start camera. Make sure you allowed camera access in Safari settings.");
+    }));
+
+    stopBtn.addEventListener("click", stopCamera);
+    torchBtn.addEventListener("click", toggleTorch);
+
+    clearBtn.addEventListener("click", () => {
+      historyEl.innerHTML = "";
+      setLatest("—");
+      lastValue = "";
+    });
+  </script>
+</body>
+</html>
